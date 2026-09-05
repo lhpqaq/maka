@@ -1,0 +1,14 @@
+{
+  "checkedAt": "2026-09-05T20:06:52.351Z",
+  "node": "v22.22.2",
+  "nodeExecutable": "/opt/homebrew/Cellar/node@22/22.22.2_1/bin/node",
+  "sqliteRuntime": "3.53.0",
+  "sqliteNodeBuildMetadata": "3.51.3",
+  "cpu": "Apple M2",
+  "platform": "darwin",
+  "release": "24.1.0",
+  "arch": "arm64",
+  "implementation": "99ac97bc6625d14f044f8ed7be41d29231e629da",
+  "benchmarkHarnessSha256": "2f6bb406dc5de1148de91c41ce77f72fcac8a8e2e0423df78619d856df2efe79",
+  "negativeControlHarnessSha256": "9ed5ca74733889c4c55e8d3d7292f0c6cd80fb7283b63f9baa6fd375a3e5479c"
+}

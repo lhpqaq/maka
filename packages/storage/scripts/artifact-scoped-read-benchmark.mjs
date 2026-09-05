@@ -19,8 +19,8 @@
 
 // Build core/storage first. Requires Node >=22.19 (registerHooks) and esbuild.
 // Example: node packages/storage/scripts/artifact-scoped-read-benchmark.mjs \
-//   --before=eca7778b1 --after=46b131dfe > /tmp/artifact-benchmark.json
-// Both revisions' two changed modules are compiled identically in memory;
+//   --before=eca7778b1 --after=HEAD --growth=target --sizes=10,1000,12000
+// Both revisions' three changed modules (including schema) compile identically in memory;
 // dependencies use this checkout's dist. No checkout, database or source is overwritten.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -70,7 +70,7 @@ function quantile(values, fraction) {
 function runComparison() {
   const before = git('rev-parse', '--verify', `${args.before ?? 'HEAD^'}^{commit}`).trim();
   const after = git('rev-parse', '--verify', `${args.after ?? 'HEAD'}^{commit}`).trim();
-  const modulePaths = ['artifact-store', 'sqlite-artifact-metadata'].map(
+  const modulePaths = ['artifact-store', 'sqlite-artifact-metadata', 'sqlite-artifact-schema'].map(
     (name) => `packages/storage/src/${name}.ts`,
   );
   // Refuse comparisons that silently leave other product changes out of the loader.
@@ -87,32 +87,40 @@ function runComparison() {
   assert.deepEqual(
     unexpectedChanges,
     [],
-    'The compared revisions must differ only in the two Artifact modules and tests/docs',
+    'The compared revisions must differ only in the three Artifact modules and tests/docs',
   );
   const sizes = (args.sizes ?? '100,1000,12000,50000')
     .split(',')
     .map((value) => positiveInteger(value));
   const config = {
+    growth: args.growth ?? 'other',
+    operationNames: args.operations?.split(','),
     rounds: positiveInteger(args.rounds, 3),
     samples: positiveInteger(args.samples, 15),
     writeSamples: positiveInteger(args['write-samples'], 8),
     copySamples: positiveInteger(args['copy-samples'], 5),
-    warmup: positiveInteger(args.warmup, 3),
-    warmupMs: args['warmup-ms'] === undefined ? 0 : positiveInteger(args['warmup-ms']),
+    warmup: positiveInteger(args.warmup, 30),
+    warmupMs: positiveInteger(args['warmup-ms'], 1000),
     timeoutMs: positiveInteger(args['timeout-ms'], 180_000),
   };
+  assert.ok(['target', 'other'].includes(config.growth));
+  if (config.growth === 'target') assert.ok(sizes.every((size) => size >= 10));
   const runs = [];
   const startedAt = new Date().toISOString();
-  for (const [sizeIndex, backgroundCount] of sizes.entries()) {
+  for (const [sizeIndex, size] of sizes.entries()) {
+    const backgroundCount = config.growth === 'other' ? size : 100;
+    const targetCount = config.growth === 'target' ? size : 10;
     for (let round = 0; round < config.rounds; round++) {
       const order = (round + sizeIndex) % 2 === 0 ? ['before', 'after'] : ['after', 'before'];
       for (const variant of order) {
         process.stderr.write(
-          `background=${backgroundCount} round=${round + 1}/${config.rounds} ${variant}\n`,
+          `background=${backgroundCount} target=${targetCount} round=${round + 1}/${config.rounds} ${variant}\n`,
         );
         const options = {
           ...config,
           backgroundCount,
+          targetCount,
+          size,
           round,
           variant,
           revision: variant === 'before' ? before : after,
@@ -135,15 +143,15 @@ function runComparison() {
     }
   }
   const summary = [];
-  for (const backgroundCount of sizes) {
+  for (const size of sizes) {
     const names = runs
-      .find((run) => run.backgroundCount === backgroundCount)
+      .find((run) => run.size === size)
       .operations.map((operation) => operation.name);
     for (const name of names) {
       const pair = {};
       for (const variant of ['before', 'after']) {
         const entries = runs
-          .filter((run) => run.backgroundCount === backgroundCount && run.variant === variant)
+          .filter((run) => run.size === size && run.variant === variant)
           .map((run) => run.operations.find((operation) => operation.name === name));
         for (const entry of entries) assert.deepEqual(entry.counts, entries[0].counts);
         const samples = entries.flatMap((entry) => entry.samplesMs);
@@ -164,7 +172,9 @@ function runComparison() {
         };
       }
       summary.push({
-        backgroundCount,
+        size,
+        backgroundCount: config.growth === 'other' ? size : 100,
+        targetCount: config.growth === 'target' ? size : 10,
         name,
         ...pair,
         medianSpeedup: pair.before.medianMs / pair.after.medianMs,
@@ -186,7 +196,7 @@ function runComparison() {
     config,
     sizes,
     method:
-      'Sequential fresh processes, alternating variants; fixed 10-record source Session and 1 linked record, 4 KiB payloads; prewarmed API latency. Each operation warms up until both minimum call count and cumulative API time are satisfied; convergence is not assumed. Setup, assertions, cleanup and count instrumentation excluded from timed samples. Mutations reset fixture metadata after every call. Background is valid metadata only, without payload files. No physical purge, cold-cache or end-to-end UI benchmark.',
+      'Sequential fresh processes, alternating variants and rotating operations. Each revision uses its own Artifact store, repository and schema, compiled identically in memory. Grow either unrelated Sessions (target fixed at 10) or the target Session (background fixed at 100). Ten target records and one link have real 4 KiB payloads; all additional growth records are valid metadata only. Create writes into the existing target Session. Warmup satisfies both minimum call count and API time; convergence is not assumed. Setup, assertions, cleanup and count instrumentation are outside timings. Mutations reset fixture rows after every call. No physical purge, cold-cache or end-to-end UI measurement.',
     summary,
     runs,
   };
@@ -194,8 +204,13 @@ function runComparison() {
 
 async function runWorker(options) {
   const moduleSources = new Map();
-  for (const name of ['artifact-store', 'sqlite-artifact-metadata']) {
+  let scopedReads = false;
+  let persistedRevisions = false;
+  for (const name of ['artifact-store', 'sqlite-artifact-metadata', 'sqlite-artifact-schema']) {
     const source = git('show', `${options.revision}:packages/storage/src/${name}.ts`);
+    if (name === 'artifact-store') scopedReads = source.includes('listBySession(');
+    if (name === 'sqlite-artifact-metadata')
+      persistedRevisions = source.includes('getSessionRevision(');
     moduleSources.set(
       pathToFileURL(join(repoRoot, `packages/storage/dist/${name}.js`)).href,
       transformSync(source, { loader: 'ts', format: 'esm', target: 'es2022' }).code,
@@ -216,7 +231,7 @@ async function runWorker(options) {
     '../dist/sqlite-artifact-metadata.js'
   );
   const { acquireOperationalStateDatabase } = await import('../dist/operational-state-store.js');
-  assert.equal(loaded.size, 2, 'Both compared modules must come from the requested revision');
+  assert.equal(loaded.size, 3, 'All three compared modules must come from the requested revision');
   const root = await mkdtemp(join(tmpdir(), 'maka-artifact-benchmark-'));
   const authority = createSqliteArtifactStoreWriteAuthority(root);
   const repository = createSqliteArtifactMetadataRepository(root);
@@ -237,8 +252,23 @@ async function runWorker(options) {
     const target = [];
     for (const input of inputs) target.push(await store.create(input));
     await store.create({ ...inputs[0], id: 'bench-linked', sessionId: 'bench-linked-session' });
+    repository.applyChanges({
+      upserts: Array.from({ length: options.targetCount - 10 }, (_, offset) => {
+        const i = offset + 10;
+        const id = `bench-target-${i}`;
+        const name = `target-${i}.txt`;
+        return {
+          ...target[0],
+          id,
+          name,
+          turnId: 'other-turn',
+          createdAt: i,
+          relativePath: `bench-target-session/${id}-${name}`,
+        };
+      }),
+    });
     seedBackground(repository, options.backgroundCount);
-    const totalRecords = options.backgroundCount + 11;
+    const totalRecords = options.backgroundCount + options.targetCount + 1;
     async function cleanupRecords(records) {
       repository.applyChanges({ deleteIds: records.map((record) => record.id) });
       await Promise.all(records.map((record) => rm(join(root, 'artifacts', record.relativePath))));
@@ -252,25 +282,25 @@ async function runWorker(options) {
       },
       {
         name: 'listPage',
-        rowsAfter: 10,
+        rowsAfter: options.targetCount,
         invoke: () => store.listPage('bench-target-session', { offset: 2, limit: 2 }),
         verify: (result) => {
-          assert.equal(result.total, 10);
+          assert.equal(result.total, options.targetCount);
           assert.deepEqual(
             result.records.map((record) => record.id),
-            ['bench-target-7', 'bench-target-6'],
+            [`bench-target-${options.targetCount - 3}`, `bench-target-${options.targetCount - 4}`],
           );
         },
       },
       {
         name: 'getInSession',
-        rowsAfter: 10,
+        rowsAfter: persistedRevisions ? 1 : options.targetCount,
         invoke: () => store.getInSession('bench-target-session', 'bench-target-0'),
         verify: (result) => assert.deepEqual(result.record, target[0]),
       },
       {
         name: 'listTurn',
-        rowsAfter: 10,
+        rowsAfter: options.targetCount,
         invoke: () => store.listTurnArtifacts('bench-target-session', 'selected-turn'),
         verify: (result) =>
           assert.deepEqual(
@@ -289,13 +319,13 @@ async function runWorker(options) {
         rowsAfter: 0,
         samples: options.writeSamples,
         invoke: () =>
-          store.create({ ...inputs[0], id: 'bench-created', sessionId: 'bench-new-session' }),
+          store.create({ ...inputs[0], id: 'bench-created', sessionId: 'bench-target-session' }),
         verify: (result) => assert.equal(result.sizeBytes, 4096),
         cleanup: (result) => cleanupRecords([result]),
       },
       {
         name: 'copyConversation',
-        rowsAfter: 11,
+        rowsAfter: options.targetCount + 1,
         rowsBefore: totalRecords * 7 + 15,
         samples: options.copySamples,
         invoke: () =>
@@ -326,7 +356,10 @@ async function runWorker(options) {
           );
         },
       },
-    ];
+    ].filter(
+      (operation) => !options.operationNames || options.operationNames.includes(operation.name),
+    );
+    if (options.operationNames) assert.equal(operations.length, options.operationNames.length);
     const results = [];
     // Rotate operation order between rounds to reduce fixed JIT/order bias.
     const rotated = [...operations.slice(options.round), ...operations.slice(0, options.round)];
@@ -360,11 +393,12 @@ async function runWorker(options) {
         counter.restore();
         if (countedResult && operation.cleanup) await operation.cleanup(countedResult);
       }
-      const expected =
-        options.variant === 'after' ? operation.rowsAfter : (operation.rowsBefore ?? totalRecords);
+      const expected = scopedReads ? operation.rowsAfter : (operation.rowsBefore ?? totalRecords);
+      const expectedRevisionRows =
+        persistedRevisions && ['getInSession', 'listPage'].includes(operation.name) ? 1 : 0;
       assert.deepEqual(
         counter.counts,
-        { returnedRows: expected, decodedRecords: expected },
+        { returnedRows: expected, decodedRecords: expected, revisionRows: expectedRevisionRows },
         operation.name,
       );
       assert.equal(
@@ -377,6 +411,13 @@ async function runWorker(options) {
       variant: options.variant,
       revision: options.revision,
       backgroundCount: options.backgroundCount,
+      targetCount: options.targetCount,
+      size: options.size,
+      schemaVersion: lease.database
+        .prepare("SELECT version FROM operational_schema_migrations WHERE scope = 'artifact'")
+        .get().version,
+      scopedReads,
+      persistedRevisions,
       round: options.round,
       operations: results,
     };
@@ -405,22 +446,23 @@ function seedBackground(repository, count) {
 }
 
 function instrumentReads(database) {
-  const counts = { returnedRows: 0, decodedRecords: 0 };
+  const counts = { returnedRows: 0, decodedRecords: 0, revisionRows: 0 };
   const originalPrepare = database.prepare;
   const originalParse = JSON.parse;
   database.prepare = function (sql) {
     const statement = originalPrepare.call(this, sql);
-    if (/\bSELECT\b/i.test(sql) && /\bartifact_records\b/i.test(sql)) {
+    if (/\bSELECT\b/i.test(sql) && /\bartifact_(records|session_revisions)\b/i.test(sql)) {
+      const field = /\bartifact_session_revisions\b/.test(sql) ? 'revisionRows' : 'returnedRows';
       const all = statement.all;
       const get = statement.get;
       statement.all = function (...params) {
         const result = all.apply(this, params);
-        counts.returnedRows += result.length;
+        counts[field] += result.length;
         return result;
       };
       statement.get = function (...params) {
         const result = get.apply(this, params);
-        if (result) counts.returnedRows++;
+        if (result) counts[field]++;
         return result;
       };
     }

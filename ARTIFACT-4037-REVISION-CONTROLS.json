@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "name": "current implementation",
+      "expectedFailures": 0,
+      "observedFailures": 0,
+      "passed": true
+    },
+    {
+      "name": "previous getInSession implementation",
+      "expectedFailures": 6,
+      "observedFailures": 6,
+      "passed": true
+    },
+    {
+      "name": "read snapshot removed",
+      "expectedFailures": 2,
+      "observedFailures": 2,
+      "passed": true
+    }
+  ]
+}
